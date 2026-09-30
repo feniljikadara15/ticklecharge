@@ -1,0 +1,295 @@
+{
+  "name": "[Tickle Charge] Call Scraping Workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 12
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        304,
+        112
+      ],
+      "id": "c0bea015-f57c-4389-b792-ec31a7281647",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Search targets. Keywords in the same sub are OR-grouped into\n// batches of KEYWORDS_PER_QUERY so we cover many more phrases\n// with fewer Reddit requests.\n// sub: null  => site-wide Reddit search (all subreddits)\n// ============================================================\nconst KEYWORDS_PER_QUERY = 3;\nconst RESULTS_PER_FEED = 100; // Reddit default is 25\n\nconst targets = [\n  // ---------- Payments communities (best conversion) ----------\n  { sub: 'PaymentProcessing', keywords: ['merchant account terminated', 'MID terminated', 'high risk processor', 'rolling reserve', 'approval rate', 'decline rate', 'payment orchestration', 'chargeback ratio', 'funds held', 'iGaming', 'peptide', 'nutra'] },\n  { sub: 'merchantservices', keywords: ['high risk', 'merchant account terminated', 'frozen funds', 'approval rate', 'rolling reserve', 'MATCH list'] },\n  { sub: 'payments', keywords: ['high risk', 'PSP recommendation', 'chargeback', 'cross-border', 'payment orchestration', 'acquirer'] },\n  { sub: 'fintech', keywords: ['multi PSP', 'payment orchestration', 'white label PSP', 'smart routing', 'high risk payments', 'acquiring'] },\n  { sub: 'Stripe', keywords: ['account closed', 'funds held', 'high risk', 'alternative to Stripe', 'rejected', 'reserve'] },\n  { sub: 'paypal', keywords: ['account limited', 'funds held', 'alternative to PayPal', '180 days'] },\n\n  // ---------- iGaming ----------\n  { sub: 'iGaming', keywords: ['payment processor', 'PSP', 'chargeback', 'approval rate', 'FTD', 'payment provider'] },\n  { sub: 'gambling', keywords: ['casino payment processor', 'sportsbook payments', 'operator payments'] },\n  { sub: 'sportsbook', keywords: ['payment processor', 'payment provider', 'white label'] },\n  { sub: 'onlinegambling', keywords: ['payment processor', 'payment provider', 'operator'] },\n\n  // ---------- Forex / trading ----------\n  { sub: 'Forex', keywords: ['payment processor', 'PSP', 'broker payments', 'deposit problems'] },\n  { sub: 'algotrading', keywords: ['prop firm payment processor', 'prop firm Stripe'] },\n  { sub: 'Daytrading', keywords: ['prop firm payment processor'] },\n\n  // ---------- Adult ----------\n  { sub: 'SexWorkers', keywords: ['payment processor', 'merchant account', 'CCBill'] },\n  { sub: 'onlyfansadvice', keywords: ['payment processor', 'own site payments', 'CCBill'] },\n\n  // ---------- Nutra / CBD / Peptides ----------\n  { sub: 'CBD', keywords: ['payment processor', 'merchant account', 'high risk processor'] },\n  { sub: 'hempflowers', keywords: ['payment processor', 'merchant account'] },\n  { sub: 'Peptides', keywords: ['payment processor', 'merchant account', 'Stripe'] },\n  { sub: 'Supplements', keywords: ['payment processor', 'merchant account', 'Stripe banned'] },\n  { sub: 'Nootropics', keywords: ['payment processor', 'merchant account'] },\n\n  // ---------- Merchants / eCommerce ----------\n  { sub: 'ecommerce', keywords: ['high risk payment', 'merchant account terminated', 'Stripe banned', 'payment processor recommendation', 'chargebacks', 'rolling reserve'] },\n  { sub: 'shopify', keywords: ['Shopify Payments disabled', 'high risk', 'third party payment gateway'] },\n  { sub: 'woocommerce', keywords: ['high risk gateway', 'payment gateway recommendation', 'Stripe banned'] },\n  { sub: 'smallbusiness', keywords: ['merchant account terminated', 'high risk processor', 'funds held'] },\n  { sub: 'Entrepreneur', keywords: ['payment processor', 'merchant account', 'Stripe banned'] },\n  { sub: 'SaaS', keywords: ['payment processor', 'Stripe banned'] },\n  { sub: 'affiliatemarketing', keywords: ['FTD', 'iGaming payments', 'nutra offer payments'] },\n\n  // ---------- Site-wide high-intent phrases (no subreddit) ----------\n  { sub: null, keywords: [\n    'high risk merchant account', 'MID terminated', 'rolling reserve processor',\n    'casino payment processor', 'sportsbook payment processor', 'iGaming PSP',\n    'forex payment processor', 'CFD broker PSP', 'prop firm payment processor',\n    'adult payment processor', 'CBD merchant account', 'peptide payment processor',\n    'nutra merchant account', 'high risk payment gateway', 'payment orchestration platform',\n    'white label PSP', 'crypto on ramp provider', 'looking for acquirer'\n  ] }\n];\n\nfunction chunk(arr, size) {\n  const out = [];\n  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));\n  return out;\n}\n\nconst results = [];\nlet counter = 1;\n\nfor (const target of targets) {\n  for (const group of chunk(target.keywords, KEYWORDS_PER_QUERY)) {\n    // \"a b\" OR \"c d\" -> phrase search, any of the phrases\n    const query = group.map(k => `\"${k.trim()}\"`).join(' OR ');\n    const base = target.sub\n      ? `https://www.reddit.com/r/${target.sub}/search.rss?restrict_sr=1&`\n      : `https://www.reddit.com/search.rss?`;\n\n    results.push({\n      json: {\n        id: counter++,\n        subreddit: target.sub || 'all',\n        searchQuery: group.join(' | '),\n        feedUrl: `${base}q=${encodeURIComponent(query)}&sort=new&t=month&limit=${RESULTS_PER_FEED}`,\n        useProxy: true,\n        generatedAt: new Date().toISOString()\n      }\n    });\n  }\n}\n\nreturn results;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        528,
+        112
+      ],
+      "id": "fbe9c8e7-43c2-44c7-89c7-a8a64bb6b4ee",
+      "name": "Generate Search URLs"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        976,
+        112
+      ],
+      "id": "9561d778-3bcf-401c-a40c-a7e65d896dc3",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "40f41f95-5539-4690-b8b3-7c2408c65955",
+              "name": "feedUrl",
+              "value": "={{ $json.feedUrl }}",
+              "type": "string"
+            },
+            {
+              "id": "bb3020b7-8636-470d-864f-85700bd5a213",
+              "name": "=searchKeyword",
+              "value": "={{ $json.searchQuery }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        752,
+        112
+      ],
+      "id": "1d427247-63da-494d-b9e8-471916a9447d",
+      "name": "Edit Fields"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://workflows.smallbaydigital.com/webhook/d11c8152-2845-4fde-bf23-9899d9282073",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "feedUrl",
+              "value": "={{ $json.feedUrl }}"
+            },
+            {
+              "name": "searchKeyword",
+              "value": "={{ $json.searchKeyword }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1184,
+        208
+      ],
+      "id": "1ec8c276-1f5d-4883-b6a5-2611a58ebb7e",
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "amount": 2,
+        "unit": "minutes"
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1392,
+        208
+      ],
+      "id": "cd27a15a-774a-429d-832b-a44d7ace2b57",
+      "name": "Wait",
+      "webhookId": "844e1e3e-16a5-4f69-9a3b-5e774e935f45"
+    },
+    {
+      "parameters": {
+        "amount": 2
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1184,
+        16
+      ],
+      "id": "0bb7fe84-466a-4c11-ba6b-c541734d5689",
+      "name": "Wait for 2 sec",
+      "webhookId": "337bbf83-6072-4734-8125-419fb22bf3c3"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1Ik3_ISvhgLM320VBRifRm_piPYDesDodgxZmhBZ-5VM",
+          "mode": "list",
+          "cachedResultName": "Copy of Tickle Charge - Scraping Results",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1Ik3_ISvhgLM320VBRifRm_piPYDesDodgxZmhBZ-5VM/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 1305925520,
+          "mode": "list",
+          "cachedResultName": "Workflow Run",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1Ik3_ISvhgLM320VBRifRm_piPYDesDodgxZmhBZ-5VM/edit#gid=1305925520"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Logs for each run": "=Workflow completed successfully at {{ $now }}"
+          },
+          "matchingColumns": [
+            "Logs for each run"
+          ],
+          "schema": [
+            {
+              "id": "Logs for each run",
+              "displayName": "Logs for each run",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1392,
+        16
+      ],
+      "id": "b81ae2a2-a586-4686-ad17-52baa5081fff",
+      "name": "Append row in sheet",
+      "executeOnce": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "kxXTYzWSmEfZ9uuw",
+          "name": "Google Sheets account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Generate Search URLs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Search URLs": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [
+          {
+            "node": "Wait for 2 sec",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for 2 sec": {
+      "main": [
+        [
+          {
+            "node": "Append row in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "2350ac03-53e0-467a-a91d-ea2651c5ba70",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "3328a5a5ee013cbab7d997baa7fb46da1b7845d3e8dec393618acee76f1ada8c"
+  },
+  "id": "50fwZbXDCYB_bdUaOD724",
+  "tags": []
+}

@@ -1,0 +1,1094 @@
+{
+  "name": "[Tickle Charge] Receive and Start Scraping",
+  "nodes": [
+    {
+      "parameters": {
+        "url": "={{ $json.body.feedUrl }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            },
+            {
+              "name": "Accept",
+              "value": "application/rss+xml, application/xml, text/xml"
+            }
+          ]
+        },
+        "options": {
+          "redirect": {
+            "redirect": {
+              "maxRedirects": 3
+            }
+          },
+          "proxy": "http://YOUR_DECODO_USER:YOUR_DECODO_PASSWORD@dc.decodo.com:10001",
+          "timeout": 30000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1856,
+        176
+      ],
+      "id": "0d40d36b-aabc-4247-be88-7f99d0d3e822",
+      "name": "Fetch RSS Feed (with Proxy)",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "sTB42VLSrsxoh50j",
+          "name": "Unnamed credential"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {
+          "explicitArray": false,
+          "ignoreAttrs": false
+        }
+      },
+      "type": "n8n-nodes-base.xml",
+      "typeVersion": 1,
+      "position": [
+        -1632,
+        176
+      ],
+      "id": "458ce857-fc26-4942-bd12-5f5d3370fdb6",
+      "name": "Parse RSS to JSON"
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $('Parse RSS to JSON').first().json;\nconst searchMetadata = $('Add Search Metadata').first().json;\nconst searchKeyword = $('Webhook').first().json.body.searchKeyword;\n\n// ================= SETTINGS =================\n// Posts older than this are skipped. 7 days was too short for niche subs.\nconst MAX_AGE_HOURS = 720; // 30 days\n// A post must mention at least one of these to be sent to the AI.\n// Cuts GPT cost and junk rows (e.g. gamblers complaining about a casino).\nconst RELEVANCE_TERMS = [\n  'processor', 'processing', 'merchant', 'psp', 'acquir', 'gateway', 'chargeback',\n  'reserve', 'decline', 'approval rate', 'high risk', 'high-risk', 'mid ', 'stripe',\n  'paypal', 'payout', 'settlement', 'underwrit', 'payments', 'payment provider',\n  'card payments', 'orchestration', 'white label', 'white-label', 'ccbill', 'nuvei',\n  'paysafe', 'checkout', 'on-ramp', 'on ramp', 'bank account closed', 'frozen'\n];\n// Posts already analyzed in a previous run (kept for 90 days).\nconst staticData = $getWorkflowStaticData('global');\nstaticData.seenPosts = staticData.seenPosts || {};\nconst now = Date.now();\nfor (const [url, ts] of Object.entries(staticData.seenPosts)) {\n  if (now - ts > 90 * 24 * 60 * 60 * 1000) delete staticData.seenPosts[url];\n}\n// ============================================\n\n// Handle different RSS/Atom structures\nlet items = [];\n\n// Try Atom format first (feed.entry)\nif (input.feed?.entry) {\n  items = Array.isArray(input.feed.entry) \n    ? input.feed.entry \n    : [input.feed.entry];\n}\n// Fall back to RSS format (rss.channel.item)\nelse if (input.rss?.channel?.item) {\n  items = Array.isArray(input.rss.channel.item) \n    ? input.rss.channel.item \n    : [input.rss.channel.item];\n}\n\nif (items.length === 0) {\n  console.log(`⚠️ No items found for query: ${searchMetadata.searchQuery}`);\n  return [];\n}\n\n// Calculate hours ago\nfunction getHoursAgo(pubDate) {\n  try {\n    const postDate = new Date(pubDate);\n    const now = new Date();\n    if (isNaN(postDate.getTime())) return 999;\n    return Math.floor((now - postDate) / (1000 * 60 * 60));\n  } catch {\n    return 999;\n  }\n}\n\n// Extract subreddit from URL or category\nfunction extractSubreddit(url, category) {\n  // Try URL first\n  const urlMatch = url?.match(/reddit\\.com\\/r\\/([^\\/\\?]+)/i);\n  if (urlMatch) return urlMatch[1];\n  \n  // Try category label\n  if (category?.label) {\n    const labelMatch = category.label.match(/r\\/([^\\/\\s]+)/);\n    if (labelMatch) return labelMatch[1];\n  }\n  \n  // Try category term\n  if (category?.term) {\n    return category.term;\n  }\n  \n  return 'Unknown';\n}\n\n// Clean HTML content\nfunction cleanContent(htmlContent) {\n  if (!htmlContent) return '';\n  \n  // Remove HTML tags\n  let cleaned = htmlContent.replace(/<[^>]*>/g, ' ');\n  \n  // Decode common HTML entities\n  cleaned = cleaned\n    .replace(/&amp;/g, '&')\n    .replace(/&lt;/g, '<')\n    .replace(/&gt;/g, '>')\n    .replace(/&quot;/g, '\"')\n    .replace(/&#39;/g, \"'\")\n    .replace(/&nbsp;/g, ' ');\n  \n  // Remove multiple spaces and trim\n  cleaned = cleaned.replace(/\\s+/g, ' ').trim();\n  \n  return cleaned.substring(0, 500);\n}\n\nconst results = items.map(item => {\n  // Extract data (handle both Atom and RSS formats)\n  const title = item.title || '';\n  const link = item.link?.href || item.link || '';\n  const pubDate = item.published || item.updated || item.pubDate || '';\n  const content = item.content?._ || item.content || item.summary || item.description || '';\n  const author = (item.author?.name || item.author || 'Unknown').replace('/u/', '').replace('u/', '');\n  const category = item.category || {};\n  \n  // Extract subreddit\n  const subreddit = extractSubreddit(link, category);\n\n  const hoursAgo = getHoursAgo(pubDate);\n  const cleaned = cleanContent(content);\n  const haystack = `${title} ${cleaned}`.toLowerCase();\n  const isRelevant = RELEVANCE_TERMS.some(t => haystack.includes(t));\n  const alreadySeen = Boolean(staticData.seenPosts[link]);\n\n  let skipReason = '';\n  if (hoursAgo >= MAX_AGE_HOURS) skipReason = 'too old';\n  else if (alreadySeen) skipReason = 'already analyzed';\n  else if (!isRelevant) skipReason = 'not payment related';\n  \n  return {\n    json: {\n      // Post data\n      title: title,\n      postUrl: link,\n      author: author,\n      pubDate: pubDate,\n      hoursAgo: hoursAgo,\n      contentSnippet: cleaned,\n      eligible: skipReason === '',\n      skipReason: skipReason,\n      subreddit: subreddit,\n      \n      // Search metadata\n      searchQuery: searchKeyword,\n      category: searchMetadata.category,\n      industry: searchMetadata.industry,\n      serviceType: searchMetadata.serviceType,\n      searchStrategy: searchMetadata.searchStrategy,\n      \n      // Tracking\n      searchId: searchMetadata.searchId,\n      scrapedAt: new Date().toISOString()\n    }\n  };\n});\n\nconsole.log(`✅ ${results.filter(r => r.json.eligible).length}/${results.length} eligible posts for: ${searchKeyword}`);\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -528,
+        160
+      ],
+      "id": "f34feb5a-2838-4a91-bc83-c50da50c550d",
+      "name": "Extract RSS Items"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Input: AI agent output. MUST always return exactly one item,\n// otherwise \"Loop Over Items4\" never gets control back and the rest\n// of the posts in this feed are silently dropped.\nconst post = $('Edit Fields4').first().json;\nconst raw = ($input.first().json.output || '').toString();\n\nlet parsed = null;\nconst match = raw.match(/\\{[\\s\\S]*\\}/); // tolerate ```json fences / preamble\nif (match) {\n  try { parsed = JSON.parse(match[0]); } catch (e) { console.error('JSON Parse Error:', e); }\n}\n\nconst list = v => Array.isArray(v) ? v.join(', ') : (v ?? '');\n\n// Remember this post so later runs skip it (only when the AI actually answered).\nif (parsed) {\n  const staticData = $getWorkflowStaticData('global');\n  staticData.seenPosts = staticData.seenPosts || {};\n  staticData.seenPosts[post.postUrl] = Date.now();\n}\n\nparsed = parsed || {\n  isQualified: false,\n  leadTier: 'Error',\n  redFlags: [`AI output could not be parsed: ${$input.first().json.error?.message || raw.slice(0, 200)}`]\n};\n\nreturn [{\n  json: {\n    isQualified: parsed.isQualified ?? false,\n    qualificationScore: parsed.qualificationScore ?? 0,\n    leadTier: parsed.leadTier ?? '',\n    priority: parsed.priority ?? '',\n    industry: parsed.industry ?? '',\n    subIndustry: parsed.subIndustry ?? '',\n    volumeEstimate: parsed.volumeEstimate ?? '',\n    geographicRegion: parsed.geographicRegion ?? '',\n    competitorMentioned: parsed.competitorMentioned ?? '',\n    painPoints: list(parsed.painPoints),\n    keySignals: list(parsed.keySignals),\n    redFlags: list(parsed.redFlags),\n    suggestedResponse: parsed.suggestedResponse ?? ''\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1392,
+        272
+      ],
+      "id": "a5793b26-b042-44b8-9179-ec179f219cfa",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -336,
+        160
+      ],
+      "id": "ca1a902e-cbef-4975-9c47-fad2756816ef",
+      "name": "Loop Over Items4"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "73a15697-5269-466d-a657-c1973abe98ec",
+              "leftValue": "={{ $json.eligible }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        16,
+        272
+      ],
+      "id": "1fc0deac-32f1-426b-83cc-c17c54f8f23a",
+      "name": "If1"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "03eb7b87-396e-4317-8d6f-15238dc863a9",
+              "name": "postUrl",
+              "value": "={{ $json.postUrl }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        224,
+        272
+      ],
+      "id": "1c1939d1-6696-48a4-8661-94b59ceeef59",
+      "name": "Edit Fields4"
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $('Parse RSS to JSON').first().json;\n\n// Check for items in both Atom and RSS formats\nlet hasItems = false;\n\nif (input.feed?.entry) {\n  const entries = Array.isArray(input.feed.entry) ? input.feed.entry : [input.feed.entry];\n  hasItems = entries.length > 0;\n} else if (input.rss?.channel?.item) {\n  const items = Array.isArray(input.rss.channel.item) ? input.rss.channel.item : [input.rss.channel.item];\n  hasItems = items.length > 0;\n}\n\nreturn [{\n  json: {\n    hasItems: hasItems\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -960,
+        176
+      ],
+      "id": "aa4d2cc5-78e9-46a3-bf97-612c3eb60786",
+      "name": "Check For Items"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c29b22dd-a1c7-4854-9efb-a72d0c426799",
+              "leftValue": "={{ $json.hasItems }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -752,
+        176
+      ],
+      "id": "98cd5979-6684-4059-9a86-4c6903812cd4",
+      "name": "If2"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Input: parsed Atom feed. Must never throw: a blocked/empty feed\n// should still be logged, not kill the execution.\nconst feed = $input.first().json.feed || {};\n\nconst feedId = feed.id ?? $('Webhook').first().json.body.feedUrl ?? null;\nconst entries = !feed.entry ? [] : (Array.isArray(feed.entry) ? feed.entry : [feed.entry]);\n\nconst totalPosts = entries.length;\n\nconst feedUpdatedTime = feed.updated\n  ? new Date(feed.updated).getTime()\n  : Date.now();\n\nconst HOURS_168_IN_MS = 168 * 60 * 60 * 1000;\n\nconst recentPostsCount = entries.filter(entry => {\n  if (!entry?.published) return false;\n  const publishedTime = new Date(entry.published).getTime();\n  if (isNaN(publishedTime)) return false;\n  return feedUpdatedTime - publishedTime < HOURS_168_IN_MS;\n}).length;\n\nreturn [\n  {\n    json: {\n      feed_id: feedId,\n      total_posts: totalPosts,\n      posts_with_upload_time_less_than_168_hours: recentPostsCount\n    }\n  }\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1408,
+        176
+      ],
+      "id": "5ea131c9-11c6-438c-ab06-561642062c4b",
+      "name": "Extract Metadata"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1yUfyXKrpmx-28Ev2bKxrt7tDL00Jl4VzrCn5FVrABfE",
+          "mode": "list",
+          "cachedResultName": "Tickle Charge - Scraping Results - Final",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1yUfyXKrpmx-28Ev2bKxrt7tDL00Jl4VzrCn5FVrABfE/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 2107374040,
+          "mode": "list",
+          "cachedResultName": "Scraping Metadata",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1yUfyXKrpmx-28Ev2bKxrt7tDL00Jl4VzrCn5FVrABfE/edit#gid=2107374040"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "feed id": "={{ $json.feed_id }}",
+            "total posts": "={{ $json.total_posts }}",
+            "posts with upload time less than 168 hours": "={{ $json.posts_with_upload_time_less_than_168_hours }}",
+            "date of scraping": "={{ $now }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "feed id",
+              "displayName": "feed id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "total posts",
+              "displayName": "total posts",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "posts with upload time less than 168 hours",
+              "displayName": "posts with upload time less than 168 hours",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "date of scraping",
+              "displayName": "date of scraping",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -1184,
+        176
+      ],
+      "id": "16f1ab23-ff8b-4ef0-87e4-4e4df47d81b8",
+      "name": "Update Metadata",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "kxXTYzWSmEfZ9uuw",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "amount": 10
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        -2080,
+        176
+      ],
+      "id": "146d6082-ed20-47c0-909f-cea8f74db2e8",
+      "name": "Wait",
+      "webhookId": "cbbcd5f9-732d-4cb3-b028-d2336eb6f53a"
+    },
+    {
+      "parameters": {
+        "multipleMethods": true,
+        "path": "d11c8152-2845-4fde-bf23-9899d9282073",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -2496,
+        176
+      ],
+      "id": "9ba8d95e-48fa-4f2a-aa7a-892f26c0be51",
+      "name": "Webhook",
+      "webhookId": "d11c8152-2845-4fde-bf23-9899d9282073"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        -848,
+        512
+      ],
+      "id": "466fa1b5-c674-40f2-9b0a-3f3864b78ba1",
+      "name": "Wait for 5 sec for no results",
+      "webhookId": "dea1ad45-23c3-4fcc-be0b-4db1c122d805"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        32,
+        16
+      ],
+      "id": "99d9372f-801a-4a72-9baa-77716feec23e",
+      "name": "Wait for 5 sec for results",
+      "webhookId": "f769d83e-9fc1-498d-b98d-fbcbb7ffb2b7"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1yUfyXKrpmx-28Ev2bKxrt7tDL00Jl4VzrCn5FVrABfE",
+          "mode": "list",
+          "cachedResultName": "Tickle Charge - Scraping Results - Final",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1yUfyXKrpmx-28Ev2bKxrt7tDL00Jl4VzrCn5FVrABfE/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 692480099,
+          "mode": "list",
+          "cachedResultName": "Logs",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1yUfyXKrpmx-28Ev2bKxrt7tDL00Jl4VzrCn5FVrABfE/edit#gid=692480099"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Logs for each run": "=Workflow completed for {{ $('Webhook').item.json.body.searchKeyword }} on {{ $now.format('yyyy-MM-dd') }}",
+            "Results": "Yes"
+          },
+          "matchingColumns": [
+            "Logs for each run"
+          ],
+          "schema": [
+            {
+              "id": "Results",
+              "displayName": "Results",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Logs for each run",
+              "displayName": "Logs for each run",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        224,
+        16
+      ],
+      "id": "bfc83c15-ed25-4dc4-801a-fad745e997cb",
+      "name": "Log for results",
+      "executeOnce": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "kxXTYzWSmEfZ9uuw",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1yUfyXKrpmx-28Ev2bKxrt7tDL00Jl4VzrCn5FVrABfE",
+          "mode": "list",
+          "cachedResultName": "Tickle Charge - Scraping Results - Final",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1yUfyXKrpmx-28Ev2bKxrt7tDL00Jl4VzrCn5FVrABfE/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 692480099,
+          "mode": "list",
+          "cachedResultName": "Logs",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1yUfyXKrpmx-28Ev2bKxrt7tDL00Jl4VzrCn5FVrABfE/edit#gid=692480099"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Results": "No",
+            "Logs for each run": "=Workflow completed for {{ $('Webhook').item.json.body.searchKeyword }} on {{ $now.format('yyyy-MM-dd') }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Results",
+              "displayName": "Results",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Logs for each run",
+              "displayName": "Logs for each run",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -640,
+        512
+      ],
+      "id": "012b7ebf-9e90-496c-b740-bb34646f146c",
+      "name": "Append row in sheet1",
+      "executeOnce": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "kxXTYzWSmEfZ9uuw",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const searchData = $input.first().json;\n\nreturn {\n  json: {\n    ...searchData,\n    searchId: `search_${searchData.urlNumber}_${Date.now()}`,\n    searchTimestamp: new Date().toISOString(),\n    runId: $execution.id,\n    attemptNumber: 1\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2272,
+        176
+      ],
+      "id": "e77345f9-f9de-4b73-b661-c0be69abaafb",
+      "name": "Add Search Metadata"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4",
+          "mode": "list",
+          "cachedResultName": "gpt-4"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        1088,
+        480
+      ],
+      "id": "067515d4-345d-4697-aa6a-c82a291c9822",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "jloNAbUlRSdkk0u2",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are a lead qualification expert for Tickle Charge, a global payment processing platform specializing in high-risk industries.\n\nAnalyze this Reddit post and determine if it's a qualified lead:\n\nPOST TITLE: {{ $json.title }}\nPOST CONTENT: {{ $json.contentSnippet }}\nSUBREDDIT: {{ $json.subreddit }}\nAUTHOR: {{ $json.author }}\nPUBLISH TIME: {{ $json.pubDate }}\n\n===================\nCOMPANY OVERVIEW\n===================\nTickle Charge provides global banking services with local rails, multi-currency accounts, cards, payment orchestration, and white-label PSP solutions. We work with 27+ licensed banking partners and achieve 80-85% card approval rates.\n\nKey Differentiators:\n- 80-85% card approval rates (industry-leading)\n- Fast onboarding (under 2 weeks)\n- Smart routing & payment orchestration\n- Global coverage with local rails\n- ISO status with direct bank relationships (better rates + stability)\n- Competitive volume-based pricing\n- White-label solutions available\n\nPayment Stack: Cards (global), APMs (PIX, Bliq, Interac, BDT), Crypto on/off-ramp\n\n===================\nQUALIFICATION CRITERIA\n===================\n\nCRITICAL MINIMUM REQUIREMENTS (Must meet ALL):\n✅ Monthly processing volume: MINIMUM $1M/month (hard requirement)\n✅ Legal, licensed business entity (not just an idea or startup)\n✅ Chargeback rate under 1%\n✅ NOT incorporated in restricted countries: India, Pakistan, Russia, or other restricted jurisdictions\n✅ NOT serving customers primarily in restricted countries\n✅ Legal industry operations only\n\nIf ANY of these are violated → Automatic DISQUALIFICATION (isQualified: false)\n\n===================\nINDUSTRIES WE SERVE\n===================\n\nPRIMARY INDUSTRIES (priority: \"Primary\" if qualified):\n\n1. iGaming (ALL sub-verticals):\n   - Online casinos, Sports betting, Skill gaming, Fantasy sports\n   - Sweepstakes, Poker rooms, Social casinos, All other iGaming verticals\n\n2. Forex & Trading:\n   - CFD brokers (MUST be licensed/regulated)\n   - Crypto exchanges (fiat on/off ramp only)\n   - Copy trading platforms\n   - DISQUALIFY: Unlicensed/unregulated forex operations\n\n3. Adult Content (ALL):\n   - Content subscriptions (OnlyFans-type), Dating platforms, Adult toys/products, Cam sites\n   - DISQUALIFY: Any illegal activities involving minors\n\n4. Nutraceuticals/Supplements\n5. CBD/Hemp Products\n6. Peptides/Pharmaceuticals (specific types only)\n7. Online Pharmacy\n8. PSP/Payment Processor Partnerships:\n   - White-label solutions, Payment orchestration partnerships, Regional PSP collaborations\n   - Must show genuine partnership intent with existing volume\n\nSECONDARY INDUSTRIES (priority: \"Secondary\" if qualified):\n- Low-risk eCommerce (physical goods)\n- Other high-risk verticals with legitimate payment challenges and $1M+/month volume\n\nABSOLUTE DISQUALIFIERS (isQualified: false):\n❌ Firearms/weapons\n❌ Illegal drugs or controlled substances\n❌ Tech support services\n❌ Travel/timeshares\n❌ Credit repair / Debt collection\n❌ No business which is in pre-revenue phase \n❌ Incorporated in or serving customers in: India, Pakistan, Russia, or restricted countries\n❌ Unlicensed/unregulated forex operations, igaming companies, pharma, adult\n❌ Illegal activities (especially minors, fraud, scams)\n❌ Crypto trading, NFTs, DAOs without merchant payment needs\n❌ Dropshipping or Shopify-only stores with no real payment processing needs\n❌ Personal finance, consumer banking, or consumer wallets\n❌ Affiliate arbitrage or traffic-only businesses\n❌ Students, hobby projects, or academic research\n❌ Chargeback rate above 1%\n\n===================\nGEOGRAPHIC COVERAGE\n===================\nRegions We Serve: US, Canada, Europe (strong), Africa, GCC, LATAM\nStrongest Regions: Europe and USA\nLicenses: FinCEN (US), FINTRAC (Canada)\nOffshore-friendly: Yes (with mandatory KYC)\n\nDO NOT QUALIFY if:\n- Incorporated in India, Pakistan, Russia, or restricted countries\n\n\nRestricted countries: \n\n\nAfghanistan, Algeria, American Samoa, Barbados, Cambodia, Guam, Guatemala, Tuvalu, Uzbekistan, Russia, Singapore, Saudi Arabia, Ecuador, China, Indonesia, Iceland, Taiwan, Philippines, The Central African Republic, The Democratic People’s Republic of Korea, The Democratic Republic of the Congo, The Republic of the Congo, The Republic of Guinea-Bissau, The Republic of Iraq, The Federal Republic of Somalia, The Republic of Mali, The State of Libya, The Republic of South Sudan, The Republic of the Sudan, The Republic of Yemen, The Republic of Belarus, The Republic of Burundi, The Republic of Cuba, The Islamic Republic of Iran, The Lebanese Republic, The Republic of Nicaragua, The Syrian Arab Republic, Ukraine, The Bolivarian Republic of Venezuela, The Republic of Zimbabwe, Turkey \n\n\n- Primary customer base in restricted countries\n\n===================\nPAIN POINTS (Ranked by Priority)\n===================\n1. High decline rates\n2. Delayed settlements\n3. Poor approval rates\n4. High processing fees\n5. Chargeback issues\n6. Rolling reserves/holdbacks\n7. PSP account shutdowns/terminations\n8. Card network fines\n9. Compliance/KYC burden\n10. Multiple provider management\n\nAlso strong at:\n- Cross-border payment issues\n- Limited payment methods\n- Expanding to new markets\n- Scaling volume rapidly ($2–20M/month sweet spot)\n\n===================\nHIGH-INTENT TRIGGER SIGNALS\n===================\n\nCRITICAL SIGNALS (use these to populate keySignals field):\n- \"processor shut us down\" / \"account terminated\" / \"MID terminated\"\n- \"need solution NOW\" / \"urgent\" / \"immediately\"\n- \"got banned\" / \"suspended\" / \"frozen funds\"\n- \"approval rates dropped to X%\" / \"decline rates killing us\"\n- \"Stripe banned me\" / \"PayPal froze my funds\"\n- \"multiple PSP rejections\"\n- \"warning letter from PSP\"\n- \"chargebacks out of control\"\n- \"looking for\" / \"need recommendations\"\n- \"struggling with\" / \"having issues\"\n- \"approval rates down\"\n- \"expanding to [new region]\" / \"scaling volume\"\n- \"high processing fees\" / \"settlement delays\"\n- \"rolling reserve\" / \"payment orchestration\" / \"white-label solution\"\n\nINDUSTRY JARGON (Quality Signals):\n- MDR, chargeback ratio, rolling reserve, settlement time, geos, FTD, 3DS failure rate\n- APMs, PSP, acquiring bank, processing volume in millions\n\nCOMPETITOR MENTIONS (strong signal):\n- CCbill, Paysafe, Nuvei, Instabill, Paykings\n- Stripe / PayPal (usually means under $1M — likely disqualified)\n\n===================\nVOLUME QUALIFICATION\n===================\nMINIMUM: $1M/month (HARD REQUIREMENT)\nSWEET SPOT: $2–10M/month\nNO MAXIMUM\n\nVOLUME IS USUALLY UNKNOWN ON REDDIT:\n- Almost nobody writes their monthly volume in a Reddit post.\n- \"Not mentioned in post\" is NOT a reason to disqualify. Only disqualify on volume when the post\n  explicitly states or clearly shows it is under $1M/month (e.g. \"we do $20k/month\", \"just launched\",\n  \"side project\", \"first sale\", \"~800 users, free to play\").\n- A real operating business in a primary industry with a live payment problem and unknown volume\n  is a WARM lead that sales should contact to ask about volume.\n\nIMPORTANT — Volume Estimation Rules:\n- ONLY report volume if the poster has written it explicitly in their own words in the post\n- Do NOT infer, estimate, guess, or derive volume from any indirect signals whatsoever\n- Do NOT calculate a number from ICP details, company size, industry type, or any assumption\n- If volume is not explicitly written in the post, return exactly: \"Not mentioned in post\"\n- If volume is mentioned, copy the exact phrase the poster used — word for word — nothing more\n- Correct example: poster writes \"processing $3M/month\" → return \"$3M/month\"\n- Wrong example: poster mentions \"large operation\" → do NOT return any dollar figure\n\nDISQUALIFY if:\n- \"Just launched\" with no processing history\n- \"Starting small and will scale\" (unless already above $1M)\n- Stripe/PayPal-only merchants (typically under $1M)\n\n===================\nQUALIFICATION SCORING\n===================\n\npriority: \"Primary\"\n- Primary industry (iGaming/Forex/Adult/Nutra/CBD/Peptides/Pharmacy/PSP)\n- Meets or likely meets $1M/month minimum\n- Clear operational pain mentioned\n- Licensed/regulated operation indicated\n\npriority: \"Secondary\"\n- Secondary industry OR primary industry with unclear/borderline volume\n- Some payment pain mentioned\n- Could be decision maker\n\nisQualified: false\n- Fails ANY critical minimum requirement\n- Restricted country/industry\n- Under $1M/month\n- Pre-revenue/no business\n- Student/research/hobby\n- Illegal activities\n\n===================\nLEAD TIER & SCORE\n===================\nqualificationScore (0-100):\n- +30 primary industry, +15 secondary industry\n- +25 active payment pain (terminated/frozen/declines/reserves/looking for processor)\n- +15 operating business with processing history\n- +10 explicit volume >= $1M/month, +10 industry jargon (MDR, FTD, geos, 3DS, acquirer)\n- +10 competitor mentioned (CCBill, Paysafe, Nuvei, Instabill, Paykings)\n- set to 0-20 if any ABSOLUTE DISQUALIFIER applies\n\nleadTier:\n- \"Hot\"  (score >= 70): primary industry + clear pain + operating business; contact now\n- \"Warm\" (score 45-69): plausible fit, volume or licensing unknown; contact to qualify\n- \"Cold\" (score < 45): weak fit, but no hard disqualifier\n- \"Disqualified\": any absolute disqualifier, restricted country, or explicitly under $1M/month\n\nisQualified = true when leadTier is \"Hot\" or \"Warm\".\n\n===================\nSUBREDDIT CONTEXT\n===================\nHIGH-PRIORITY: r/PaymentProcessing, r/iGaming, r/Forex, r/entrepreneur, r/ecommerce, r/PeptidePayProcessing, r/PEPTIDEPAYMENTSUSA\n\n\nMONITOR: r/startups, r/smallbusiness (usually too early, verify volume)\n\n===================\nPAIN POINTS EXTRACTION RULES\n===================\n- painPoints must be extracted directly from what the poster explicitly wrote\n- Do NOT infer, assume, or fabricate pain points based on industry or context\n- Only include a pain point if the poster described it themselves in their post\n- Quote or closely paraphrase their exact words — do not generalise\n- If no pain points are explicitly described, return an empty array []\n\n===================\nOUTPUT FORMAT\n===================\n\nRespond in valid JSON only. No preamble, no markdown, no explanation outside the JSON.\n\n{\n  \"isQualified\": true/false,\n  \"qualificationScore\": 0-100,\n  \"leadTier\": \"Hot/Warm/Cold/Disqualified\",\n  \"priority\": \"Primary/Secondary/Not Qualified\",\n  \"industry\": \"iGaming/Forex/Adult/Nutraceuticals/CBD/Peptides/Pharmacy/PSP Partnership/eCommerce/Other\",\n  \"subIndustry\": \"specific vertical if applicable (e.g. Sports Betting, CFD Broker, Content Subscriptions)\",\n  \"volumeEstimate\": \"Exact quote from post if mentioned, or 'Not mentioned in post'\",\n  \"geographicRegion\": \"US/EU/LATAM/GCC/Africa/Canada/Unknown/Multiple\",\n  \"competitorMentioned\": \"Name of competitor or None\",\n  \"painPoints\": [\"exact pain point extracted word-for-word from post 1\", \"exact pain point 2 — only what the poster explicitly described, never inferred\"],\n  \"keySignals\": [\"specific high-intent phrase or jargon from post 1\", \"phrase 2\"],\n  \"redFlags\": [\"concern or disqualifying factor 1\", \"factor 2 — or empty array if none\"],\n  \"suggestedResponse\": \"1-2 sentence helpful, non-salesy Reddit reply or DM opener (empty string if Disqualified)\"\n}\n\n===================\nCRITICAL REMINDERS\n===================\n\n1. MINIMUM $1M/MONTH — disqualify only when the post shows it is under; unknown volume = Warm, not Disqualified\n2. Geographic restrictions are HARD STOPS — India/Pakistan/Russia = instant disqualification\n3. Unlicensed forex = disqualification\n4. Pre-revenue startups = disqualification\n5. Stripe/PayPal banned merchants are USUALLY under $1M — likely disqualified\n6. volumeEstimate must ONLY reflect what is written in the post — never guess or infer\n7. Industry jargon (MDR, FTD, geos, reserve, 3DS) = sophistication signal, weight higher\n8. r/PaymentProcessing has best conversion history — weight higher\n9. Competitor mentions (CCbill, Paysafe, Nuvei, Instabill, Paykings) = strong signal\n10. Hard disqualifiers stay strict (countries, industries, pre-revenue). Everything else: score it and let the tier decide",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        1088,
+        272
+      ],
+      "id": "3684e321-ea62-4a5b-9bcd-ce81aca50278",
+      "name": "AI Qualify Lead",
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "1yUfyXKrpmx-28Ev2bKxrt7tDL00Jl4VzrCn5FVrABfE",
+          "mode": "list",
+          "cachedResultName": "Tickle Charge - Scraping Results - Final",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1yUfyXKrpmx-28Ev2bKxrt7tDL00Jl4VzrCn5FVrABfE/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 339208994,
+          "mode": "list",
+          "cachedResultName": "Scraping Result - New Prompt",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1yUfyXKrpmx-28Ev2bKxrt7tDL00Jl4VzrCn5FVrABfE/edit#gid=339208994"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "author": "={{ $('Edit Fields4').first().json.author }}",
+            "postUrl": "={{ $('Edit Fields4').first().json.postUrl }}",
+            "subreddit": "={{ $('Edit Fields4').first().json.subreddit }}",
+            "contentSnippet": "={{ $('Edit Fields4').first().json.contentSnippet }}",
+            "pubDate": "={{ $('Edit Fields4').first().json.pubDate }}",
+            "searchKeyword": "={{ $('Webhook').first().json.body.searchKeyword }}",
+            "scrapedAt": "={{ $('Edit Fields4').first().json.scrapedAt }}",
+            "isQualified": "={{ $json.isQualified }}",
+            "postTitle": "={{ $('Edit Fields4').first().json.title }}",
+            "priority": "={{ $json.priority }}",
+            "industry": "={{ $json.industry }}",
+            "subIndustry": "={{ $json.subIndustry }}",
+            "volumeEstimate": "={{ $json.volumeEstimate }}",
+            "geographicRegion": "={{ $json.geographicRegion }}",
+            "competitorMentioned": "={{ $json.competitorMentioned }}",
+            "painPoints": "={{ $json.painPoints }}",
+            "keySignals": "={{ $json.keySignals }}",
+            "redFlags": "={{ $json.redFlags }}",
+            "qualificationScore": "={{ $json.qualificationScore }}",
+            "leadTier": "={{ $json.leadTier }}",
+            "suggestedResponse": "={{ $json.suggestedResponse }}"
+          },
+          "matchingColumns": [
+            "postUrl"
+          ],
+          "schema": [
+            {
+              "id": "isQualified",
+              "displayName": "isQualified",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "postTitle",
+              "displayName": "postTitle",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "author",
+              "displayName": "author",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "postUrl",
+              "displayName": "postUrl",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "subreddit",
+              "displayName": "subreddit",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contentSnippet",
+              "displayName": "contentSnippet",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "searchKeyword",
+              "displayName": "searchKeyword",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "priority",
+              "displayName": "priority",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "industry",
+              "displayName": "industry",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "subIndustry",
+              "displayName": "subIndustry",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "volumeEstimate",
+              "displayName": "volumeEstimate",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "geographicRegion",
+              "displayName": "geographicRegion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "competitorMentioned",
+              "displayName": "competitorMentioned",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "painPoints",
+              "displayName": "painPoints",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "keySignals",
+              "displayName": "keySignals",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "redFlags",
+              "displayName": "redFlags",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "scrapedAt",
+              "displayName": "scrapedAt",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "pubDate",
+              "displayName": "pubDate",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "qualificationScore",
+              "displayName": "qualificationScore",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "leadTier",
+              "displayName": "leadTier",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "suggestedResponse",
+              "displayName": "suggestedResponse",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1584,
+        464
+      ],
+      "id": "c7bcfccf-ad1d-4408-9db0-abd4437881fc",
+      "name": "Append or update row in sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "kxXTYzWSmEfZ9uuw",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        416,
+        736
+      ],
+      "id": "5b0f7c1e-2d7a-4a55-9c1e-6f3f1d2a9b10",
+      "name": "Skip Post"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Fetch RSS Feed (with Proxy)": {
+      "main": [
+        [
+          {
+            "node": "Parse RSS to JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse RSS to JSON": {
+      "main": [
+        [
+          {
+            "node": "Extract Metadata",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract RSS Items": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Append or update row in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items4": {
+      "main": [
+        [
+          {
+            "node": "Wait for 5 sec for results",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "If1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If1": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields4",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skip Post",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields4": {
+      "main": [
+        [
+          {
+            "node": "AI Qualify Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check For Items": {
+      "main": [
+        [
+          {
+            "node": "If2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If2": {
+      "main": [
+        [
+          {
+            "node": "Extract RSS Items",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait for 5 sec for no results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Metadata": {
+      "main": [
+        [
+          {
+            "node": "Update Metadata",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Metadata": {
+      "main": [
+        [
+          {
+            "node": "Check For Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Fetch RSS Feed (with Proxy)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Add Search Metadata",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for 5 sec for results": {
+      "main": [
+        [
+          {
+            "node": "Log for results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for 5 sec for no results": {
+      "main": [
+        [
+          {
+            "node": "Append row in sheet1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add Search Metadata": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Qualify Lead",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Qualify Lead": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append or update row in sheet": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip Post": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "845fff92-8595-400b-ab00-c68c92aeeac4",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "3328a5a5ee013cbab7d997baa7fb46da1b7845d3e8dec393618acee76f1ada8c"
+  },
+  "id": "Xubnaynh2mYA7pB9JlKba",
+  "tags": []
+}
